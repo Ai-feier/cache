@@ -15,6 +15,9 @@ var (
 	
 	//go:embed lua/unlock.lua
 	luaUnlock string
+	
+	//go:embed lua/refresh.lua
+	luaRefresh string
 )
 
 type Client struct {
@@ -73,4 +76,50 @@ func (l *Lock) Unlock(ctx context.Context) error {
 		return ErrLockNotHold
 	}
 	return nil
+}
+
+func (l *Lock) Refresh(ctx context.Context) error {
+	// 需使用 lua, 需同时进行两个操作: 检查当前锁是否是我的, 和刷新超时时间
+	res, err := l.client.Eval(ctx, luaRefresh, []string{l.key}, l.val, l.expiration.Seconds()).Int64()
+	if err != nil {
+		return err
+	}
+	if res != 1 {
+		return ErrLockNotHold
+	}
+	return nil
+}
+
+func (l *Lock) AutoRefresh(interval time.Duration, timeout time.Duration) error {
+	timeoutCh := make(chan struct{}, 1)
+	// 续约的时间间隔
+	ticker := time.NewTicker(interval)
+	for {
+		select {
+		case <-ticker.C:
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			// 刷新出现错误, 分情况处理
+			err := l.Refresh(ctx)
+			cancel()
+			if errors.Is(err, context.DeadlineExceeded) {
+				timeoutCh <- struct{}{}
+			}
+			if err != nil {
+				return err
+			}
+		case <-timeoutCh:
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			err := l.Refresh(ctx)
+			cancel()
+			if errors.Is(err, context.DeadlineExceeded) {
+				timeoutCh <- struct{}{}
+				continue
+			}
+			if err != nil {
+				return err
+			}
+		case <-l.unlockCh:
+				return nil
+		}
+	}
 }
